@@ -207,6 +207,13 @@ public:
 #else
     SPIPins LoRa_bus;
 #endif
+
+    // RYLR998 UART/AT-command LoRa backend (e.g. M5Stack Core2 Grove UART port)
+#ifdef USE_RYLR998_VIA_UART
+    UARTPins LoRa_uart_bus = {(gpio_num_t)LORA_RYLR998_RX_PIN, (gpio_num_t)LORA_RYLR998_TX_PIN};
+#else
+    UARTPins LoRa_uart_bus;
+#endif
 #endif
     I2CPins sys_i2c = {(gpio_num_t)SYS_I2C_SDA, (gpio_num_t)SYS_I2C_SCL};
     I2CPins i2c_bus = {(gpio_num_t)GROVE_SDA, (gpio_num_t)GROVE_SCL};

@@ -104,6 +104,15 @@
   #define LORA_DIO0 -1
 #endif
 
+// RYLR998 UART/AT-command LoRa backend (opt-in via USE_RYLR998_VIA_UART, no default here
+// on purpose, following the same convention as USE_CC1101_VIA_SPI/USE_NRF24_VIA_SPI/etc.)
+#ifndef LORA_RYLR998_RX_PIN
+  #define LORA_RYLR998_RX_PIN -1
+#endif
+#ifndef LORA_RYLR998_TX_PIN
+  #define LORA_RYLR998_TX_PIN -1
+#endif
+
 // Default initializers
 #ifndef TFT_CS
   #define TFT_CS -1

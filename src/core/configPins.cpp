@@ -393,6 +393,7 @@ void BruceConfigPins::validateConfig() {
     validateSpiPins(ST25R_bus);
     validateSpiPins(LoRa_bus);
     validateSpiPins(W5500_bus);
+    validateUARTPins(LoRa_uart_bus);
 #endif
     validateSpiPins(CC1101_bus);
     validateSpiPins(NRF24_bus);

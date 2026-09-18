@@ -16,6 +16,15 @@
 
 extern BruceConfigPins bruceConfigPins;
 
+// RYLR998 is a UART/AT-command LoRa module (as opposed to the SPI-attached SX1276/SX1262
+// radios below). It is only wired up as the active backend when a board both opts in
+// (USE_RYLR998_VIA_UART) and has no SPI LoRa radio of its own (LORA_SCK unset) -- e.g. the
+// M5Stack Core2, which exposes the RYLR998 over its Grove UART port. Boards that already
+// have an SPI radio keep their existing SX1276/SX1262 selection UI untouched.
+#if defined(USE_RYLR998_VIA_UART) && (LORA_SCK < 0)
+#define LORA_UART_ONLY_BACKEND 1
+#endif
+
 bool update = false;
 String msg;
 String rcvmsg;
@@ -42,8 +51,142 @@ SX1276 *lora1276 = nullptr;
 SX1262 *lora1262 = nullptr;
 volatile bool loraPacketReceived = false;
 volatile bool loraInterruptEnabled = true;
-enum class LoRaRadioVariant { SX1276, SX1262 };
+enum class LoRaRadioVariant { SX1276, SX1262, RYLR998 };
+#if defined(LORA_UART_ONLY_BACKEND)
+LoRaRadioVariant loraRadioVariant = LoRaRadioVariant::RYLR998;
+#else
 LoRaRadioVariant loraRadioVariant = LoRaRadioVariant::SX1276;
+#endif
+
+#if defined(USE_RYLR998_VIA_UART)
+// ---- RYLR998 UART/AT-command backend -------------------------------------------------
+// Talks to the Reyax RYLR998 over a plain HardwareSerial using its AT command set instead
+// of RadioLib/SPI. It is kept self-contained here and only wired into the shared
+// startLoraRadio()/sendLoraMessage()/reciveMessage()/clearLoraRadio() entry points used by
+// the rest of lorachat(), so the SPI radios below are completely unaffected.
+#define RYLR998_BAUD 115200
+#define RYLR998_ADDRESS 0    // Every chat participant uses the same address so AT+SEND
+                             // reaches every other RYLR998 listening on the same frequency,
+                             // mirroring the "anyone in range hears it" behavior of the
+                             // SPI radios below.
+#define RYLR998_AT_TIMEOUT 2000
+
+HardwareSerial *rylrSerial = nullptr;
+String rylrLineBuffer;
+
+void handleRylrReceivedLine(const String &line);
+
+// Drains whatever bytes are currently available. Any complete "+RCV=..." line is treated
+// as an inbound chat message (this is what plays the role of reciveMessage() for this
+// backend). When waitForResponse is true, blocks (up to timeoutMs) for the next non-+RCV
+// line, which is the reply to an AT command just sent.
+String rylrPollLines(uint32_t timeoutMs, bool waitForResponse) {
+    if (!rylrSerial) return "";
+    String lastResponse;
+    unsigned long start = millis();
+    while (true) {
+        while (rylrSerial->available()) {
+            char c = (char)rylrSerial->read();
+            if (c == '\n') {
+                rylrLineBuffer.trim();
+                if (rylrLineBuffer.length()) {
+                    if (rylrLineBuffer.startsWith("+RCV=")) {
+                        handleRylrReceivedLine(rylrLineBuffer);
+                    } else {
+                        lastResponse = rylrLineBuffer;
+                    }
+                }
+                rylrLineBuffer = "";
+            } else if (c != '\r') {
+                rylrLineBuffer += c;
+            }
+        }
+        if (!waitForResponse || lastResponse.length() || (millis() - start > timeoutMs)) return lastResponse;
+    }
+}
+
+bool rylrSendCommand(const String &cmd, uint32_t timeoutMs = RYLR998_AT_TIMEOUT) {
+    if (!rylrSerial) return false;
+    rylrSerial->print(cmd);
+    rylrSerial->print("\r\n");
+    String resp = rylrPollLines(timeoutMs, true);
+    return resp.startsWith("+OK");
+}
+
+// Parses "+RCV=<address>,<length>,<data>,<rssi>,<snr>" and feeds <data> into the same
+// history/UI plumbing (messages vector, /chats.txt, update flag) that reciveMessage() uses
+// for the SPI radios, so LoRa Chat behaves identically regardless of backend.
+void handleRylrReceivedLine(const String &line) {
+    int firstComma = line.indexOf(',');
+    int secondComma = firstComma < 0 ? -1 : line.indexOf(',', firstComma + 1);
+    if (firstComma < 0 || secondComma < 0) return;
+    int len = line.substring(firstComma + 1, secondComma).toInt();
+    if (len <= 0 || secondComma + 1 + len > (int)line.length()) return;
+    // Slice exactly <len> bytes for the payload (rather than splitting on ',') so a message
+    // containing commas is not truncated.
+    String data = line.substring(secondComma + 1, secondComma + 1 + len);
+
+    rcvmsg = data;
+    Serial.println("Recived:" + rcvmsg);
+    File file = LittleFS.open("/chats.txt", "a");
+    file.println(rcvmsg);
+    file.close();
+    messages.push_back(rcvmsg);
+    if (messages.size() > maxMessages) { scrollOffset = messages.size() - maxMessages; }
+    update = true;
+}
+
+bool startRylrRadio(float bandMHz) {
+    if (bruceConfigPins.LoRa_uart_bus.rx == GPIO_NUM_NC || bruceConfigPins.LoRa_uart_bus.tx == GPIO_NUM_NC) {
+        Serial.println("RYLR998 UART pins not configured!");
+        displayError("RYLR998 pins not configured!", true);
+        return false;
+    }
+
+    rylrSerial = new HardwareSerial(2);
+    rylrSerial->begin(
+        RYLR998_BAUD, SERIAL_8N1, bruceConfigPins.LoRa_uart_bus.rx, bruceConfigPins.LoRa_uart_bus.tx
+    );
+    delay(100);
+    rylrLineBuffer = "";
+    while (rylrSerial->available()) rylrSerial->read();
+
+    if (!rylrSendCommand("AT")) {
+        Serial.println("RYLR998 not responding");
+        displayError("RYLR998 not found", true);
+        return false;
+    }
+
+    uint32_t bandHz = (uint32_t)(bandMHz * 1000000.0f + 0.5f);
+    if (!rylrSendCommand("AT+BAND=" + String(bandHz))) {
+        Serial.println("RYLR998 failed to set frequency");
+        displayError("LoRa Init Failed", true);
+        return false;
+    }
+
+    // Best-effort modulation setup: reuses the spreadingFactor/codingRateDenominator
+    // constants above where their meaning maps directly onto the RYLR998's AT+PARAMETER
+    // fields (coding rate N/(N+4) -> codingRateDenominator-4). Bandwidth/preamble codes
+    // differ across Reyax firmware revisions, so a conservative, widely-documented 125 kHz
+    // bandwidth and the standard preamble of 4 are used instead of trying to reproduce the
+    // SPI radios' 31.25 kHz setting exactly. This call is intentionally non-fatal: as long
+    // as both ends of the chat run the same firmware defaults they can still talk even if a
+    // particular device rejects one of these values, so failure here only logs a warning
+    // instead of aborting init (unlike the AT/AT+BAND checks above, which every RYLR998
+    // firmware revision is documented to support).
+    if (!rylrSendCommand("AT+PARAMETER=" + String(spreadingFactor) + ",7," +
+                         String(codingRateDenominator - 4) + ",4")) {
+        Serial.println("RYLR998: AT+PARAMETER not applied, continuing with current/default radio parameters");
+    }
+
+    if (!rylrSendCommand("AT+ADDRESS=" + String(RYLR998_ADDRESS))) {
+        Serial.println("RYLR998: AT+ADDRESS not applied, continuing with current/default address");
+    }
+
+    Serial.println("RYLR998 Started");
+    return true;
+}
+#endif
 
 int getLoraIrqPin() {
 #ifdef LORA_IRQ
@@ -77,6 +220,13 @@ void clearLoraRadio() {
         delete loraModule;
         loraModule = nullptr;
     }
+#if defined(USE_RYLR998_VIA_UART)
+    if (rylrSerial) {
+        rylrSerial->end();
+        delete rylrSerial;
+        rylrSerial = nullptr;
+    }
+#endif
 }
 
 void onLoraPacket() {
@@ -98,6 +248,20 @@ bool startLoraRadio(float bandMHz) {
     intlora = false;
     loraPacketReceived = false;
     loraInterruptEnabled = true;
+
+#if defined(USE_RYLR998_VIA_UART)
+    if (loraRadioVariant == LoRaRadioVariant::RYLR998) {
+        clearLoraRadio();
+        if (!startRylrRadio(bandMHz)) {
+            clearLoraRadio();
+            return false;
+        }
+        intlora = true;
+        Serial.println("LoRa Started");
+        return true;
+    }
+#endif
+
     const int irqPin = getLoraIrqPin();
     if (getLoraCsPin() == GPIO_NUM_NC || bruceConfigPins.LoRa_bus.mosi == GPIO_NUM_NC ||
         bruceConfigPins.LoRa_bus.miso == GPIO_NUM_NC || bruceConfigPins.LoRa_bus.sck == GPIO_NUM_NC) {
@@ -154,6 +318,20 @@ bool startLoraRadio(float bandMHz) {
 bool sendLoraMessage(String &payload) {
     if (!intlora) return false;
     loraInterruptEnabled = false;
+#if defined(USE_RYLR998_VIA_UART)
+    if (loraRadioVariant == LoRaRadioVariant::RYLR998) {
+        bool ok = rylrSendCommand(
+            "AT+SEND=" + String(RYLR998_ADDRESS) + "," + String(payload.length()) + "," + payload, 3000
+        );
+        loraInterruptEnabled = true;
+        if (!ok) {
+            Serial.println("RYLR998 transmit failed");
+            displayError("LoRa send failed");
+            return false;
+        }
+        return true;
+    }
+#endif
     int state = RADIOLIB_ERR_NONE;
     if (loraRadioVariant == LoRaRadioVariant::SX1276 && lora1276) {
         state = lora1276->transmit(payload);
@@ -175,6 +353,13 @@ bool sendLoraMessage(String &payload) {
 }
 
 void reciveMessage() {
+#if defined(USE_RYLR998_VIA_UART)
+    if (loraRadioVariant == LoRaRadioVariant::RYLR998) {
+        if (!intlora) return;
+        rylrPollLines(0, false); // non-blocking drain; any "+RCV=" line updates messages/rcvmsg
+        return;
+    }
+#endif
     if (!loraPacketReceived || !intlora) return;
     loraInterruptEnabled = false;
     loraPacketReceived = false;
@@ -293,6 +478,12 @@ void downpress() {
 }
 
 void selectRadioVariant(JsonDocument &doc) {
+#if defined(LORA_UART_ONLY_BACKEND)
+    // This board only has the RYLR998 UART radio (no SPI LoRa hardware), so there is
+    // nothing to choose: skip the SX1276/SX1262 picker entirely and stay on RYLR998.
+    loraRadioVariant = LoRaRadioVariant::RYLR998;
+    return;
+#endif
     String stored = doc["LoRa_Radio"] | "SX1276";
     if (stored.equalsIgnoreCase("SX1262")) { loraRadioVariant = LoRaRadioVariant::SX1262; }
     std::vector<Option> radioOptions = {
@@ -389,7 +580,11 @@ void lorachat() {
         File file = LittleFS.open("/lora_settings.json", "w");
         doc["LoRa_Frequency"] = "434500000.00";
         doc["LoRa_Name"] = "BruceTest";
+#if defined(LORA_UART_ONLY_BACKEND)
+        doc["LoRa_Radio"] = "RYLR998";
+#else
         doc["LoRa_Radio"] = "SX1276";
+#endif
         serializeJson(doc, file);
         file.close();
     }
@@ -408,14 +603,26 @@ void lorachat() {
     tft.fillScreen(TFT_BLACK);
     update = true;
     Serial.println("Initializing LoRa...");
-    Serial.println(
-        "Pins: SCK:" + String(bruceConfigPins.LoRa_bus.sck) +
-        " MISO:" + String(bruceConfigPins.LoRa_bus.miso) + " MOSI:" + String(bruceConfigPins.LoRa_bus.mosi) +
-        " CS:" + String(bruceConfigPins.LoRa_bus.cs) + " RST:" + String(getLoraResetPin()) +
-        " IRQ:" + String(getLoraIrqPin()) + "BAND: " + String(bandMHz) +
-        "MHz Radio: " + ((loraRadioVariant == LoRaRadioVariant::SX1262) ? "SX1262" : "SX1276") +
-        " DisplayName:  " + displayName
-    );
+#if defined(USE_RYLR998_VIA_UART)
+    if (loraRadioVariant == LoRaRadioVariant::RYLR998) {
+        Serial.println(
+            "RYLR998 UART RX:" + String(bruceConfigPins.LoRa_uart_bus.rx) +
+            " TX:" + String(bruceConfigPins.LoRa_uart_bus.tx) + " BAND: " + String(bandMHz) +
+            "MHz DisplayName:  " + displayName
+        );
+    } else
+#endif
+    {
+        Serial.println(
+            "Pins: SCK:" + String(bruceConfigPins.LoRa_bus.sck) +
+            " MISO:" + String(bruceConfigPins.LoRa_bus.miso) +
+            " MOSI:" + String(bruceConfigPins.LoRa_bus.mosi) + " CS:" + String(bruceConfigPins.LoRa_bus.cs) +
+            " RST:" + String(getLoraResetPin()) + " IRQ:" + String(getLoraIrqPin()) +
+            "BAND: " + String(bandMHz) +
+            "MHz Radio: " + ((loraRadioVariant == LoRaRadioVariant::SX1262) ? "SX1262" : "SX1276") +
+            " DisplayName:  " + displayName
+        );
+    }
 
     if (!startLoraRadio(bandMHz)) {
         update = true;
