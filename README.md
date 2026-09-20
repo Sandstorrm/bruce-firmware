@@ -49,9 +49,10 @@ pio run -e m5stack-core2 -t upload
 
 ## Companion controller
 
-A terminal UI for the Mac (Textual): the Core2's CLI with output feedback, a range/speed slider, power control, and a
-keyboard-driven screen mode that shows the Core2's menus and apps. It lives in `../lora-tui` here and isn't published
-yet. The wire protocol is documented in its `PROTOCOL.md`.
+The Mac side is **[Sandstorrm/lora-tui](https://github.com/Sandstorrm/lora-tui)**: a terminal UI (Textual) with the
+Core2's CLI and output feedback, a range/speed slider, power control, and a keyboard-driven screen mode that shows the
+Core2's menus and apps. It needs this firmware on the Core2, and its `PROTOCOL.md` documents the wire protocol the link
+engine here implements. Checked out side by side, it is `../lora-tui`.
 
 ## License
 
