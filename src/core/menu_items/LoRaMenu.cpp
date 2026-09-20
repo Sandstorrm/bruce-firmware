@@ -2,11 +2,18 @@
 #include "LoRaMenu.h"
 #include "core/display.h"
 #include "core/utils.h"
+#include "modules/lora/LoRaLink.h"
 #include "modules/lora/LoRaRF.h"
 
 void LoRaMenu::optionsMenu() {
     options = {
+#if defined(USE_RYLR998_VIA_UART)
+        {"Range / Speed",    []() { loraLinkSliderMenu(); }},
+        // Chat drives the same UART as the remote-control link, so pause the link meanwhile.
+        {"Chat",             []() { loraLinkStop(); lorachat(); loraLinkBegin(); }},
+#else
         {"Chat",             []() { lorachat(); }      },
+#endif
         {"Change username",  []() { changeusername(); }},
         {"Change Frequency", []() { chfreq(); }        },
     };

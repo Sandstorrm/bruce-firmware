@@ -7,6 +7,96 @@
 AUXILIARY FUNCTIONS TO CREATE THE JSONS
 */
 
+/* SCREEN TEXT SHADOW: what text is on the display right now (feeds the remote `screen view` command) */
+void tft_logger::shadowClear() {
+    portENTER_CRITICAL(&shadowMux);
+    shadowN = 0;
+    shadowGen++;
+    portEXIT_CRITICAL(&shadowMux);
+}
+
+// Text whose middle lies inside the filled rectangle has been painted over.
+void tft_logger::shadowRemoveInside(int rx, int ry, int rw, int rh) {
+    portENTER_CRITICAL(&shadowMux);
+    uint8_t k = 0;
+    for (uint8_t i = 0; i < shadowN; i++) {
+        int w = (int)strlen(shadow[i].text) * 6 * shadow[i].size, h = 8 * shadow[i].size;
+        int cx = shadow[i].x + w / 2, cy = shadow[i].y + h / 2;
+        bool gone = cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh;
+        if (!gone) shadow[k++] = shadow[i];
+    }
+    if (k != shadowN) shadowGen++;
+    shadowN = k;
+    portEXIT_CRITICAL(&shadowMux);
+}
+
+void tft_logger::shadowAdd(int x, int y, const String &str, uint8_t size) {
+    if (size == 0) size = 1;
+    int lineH = 8 * size + 2;
+    int start = 0, row = 0;
+    while (start <= (int)str.length()) {
+        int nl = str.indexOf('\n', start);
+        String part = nl < 0 ? str.substring(start) : str.substring(start, nl);
+        part.replace("\r", "");
+        if (part.length()) {
+            int px = row == 0 ? x : 0, py = y + row * lineH;
+            int w = part.length() * 6 * size, h = 8 * size;
+            portENTER_CRITICAL(&shadowMux);
+            uint8_t k = 0; // painting over earlier text on the same row replaces it
+            for (uint8_t i = 0; i < shadowN; i++) {
+                int ow = (int)strlen(shadow[i].text) * 6 * shadow[i].size, oh = 8 * shadow[i].size;
+                bool overlap = px < shadow[i].x + ow && shadow[i].x < px + w && py < shadow[i].y + oh &&
+                               shadow[i].y < py + h;
+                if (!overlap) shadow[k++] = shadow[i];
+            }
+            shadowN = k;
+            if (shadowN == SHADOW_MAX) {
+                memmove(&shadow[0], &shadow[1], sizeof(ShadowText) * (SHADOW_MAX - 1));
+                shadowN--;
+            }
+            shadowGen++;
+            ShadowText &t = shadow[shadowN++];
+            t.x = (int16_t)px;
+            t.y = (int16_t)py;
+            t.size = size;
+            strncpy(t.text, part.c_str(), sizeof t.text - 1);
+            t.text[sizeof t.text - 1] = 0;
+            portEXIT_CRITICAL(&shadowMux);
+        }
+        if (nl < 0) break;
+        start = nl + 1;
+        row++;
+    }
+}
+
+String tft_logger::getScreenText() {
+    ShadowText copy[SHADOW_MAX];
+    uint8_t n;
+    portENTER_CRITICAL(&shadowMux);
+    n = shadowN;
+    memcpy(copy, shadow, sizeof(ShadowText) * n);
+    portEXIT_CRITICAL(&shadowMux);
+    // top-to-bottom, left-to-right
+    for (uint8_t i = 1; i < n; i++) {
+        ShadowText t = copy[i];
+        int j = i - 1;
+        while (j >= 0 && (copy[j].y > t.y + 3 || (abs(copy[j].y - t.y) <= 3 && copy[j].x > t.x))) {
+            copy[j + 1] = copy[j];
+            j--;
+        }
+        copy[j + 1] = t;
+    }
+    String out;
+    int rowY = -1000;
+    for (uint8_t i = 0; i < n; i++) {
+        if (i && abs(copy[i].y - rowY) > 3) out += "\n";
+        else if (i) out += "  ";
+        if (i == 0 || abs(copy[i].y - rowY) > 3) rowY = copy[i].y;
+        out += copy[i].text;
+    }
+    return out;
+}
+
 /* TFT LOGGER FUNCTIONS */
 tft_logger::tft_logger(int16_t w, int16_t h) : BRUCE_TFT_DRIVER(w, h) {}
 tft_logger::~tft_logger() {
@@ -258,6 +348,7 @@ void tft_logger::removeOverlappedImages(int x, int y, int center, int ms) {
 }
 
 void tft_logger::fillScreen(int32_t color) {
+    shadowClear();
     if (logging) {
         clearLog();
         checkAndLog(FILLSCREEN, color);
@@ -334,6 +425,7 @@ void tft_logger::drawRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t co
 }
 
 void tft_logger::fillRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t color) {
+    if (w > 4 && h > 4) shadowRemoveInside(x, y, w, h);
     if (logging) {
         if (w > 4 && h > 4) removeLogEntriesInsideRect(x, y, w, h);
         checkAndLog(FILLRECT, x, y, w, h, color);
@@ -351,6 +443,7 @@ void tft_logger::drawRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32
 }
 
 void tft_logger::fillRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, int32_t color) {
+    if (w > 4 && h > 4) shadowRemoveInside(x, y, w, h);
     if (logging) {
         removeLogEntriesInsideRect(x, y, w, h);
         checkAndLog(FILLROUNDRECT, x, y, w, h, r, color);
@@ -475,6 +568,7 @@ void tft_logger::log_drawString(String s, tftFuncs fn, int32_t x, int32_t y) {
 }
 
 int16_t tft_logger::drawString(const String &string, int32_t x, int32_t y, uint8_t font) {
+    shadowAdd(x, y, string, currentTextSize());
     log_drawString(string, DRAWSTRING, x, y);
     int16_t r;
     if (isSleeping) return string.length();
@@ -484,6 +578,7 @@ int16_t tft_logger::drawString(const String &string, int32_t x, int32_t y, uint8
 }
 
 int16_t tft_logger::drawCentreString(const String &string, int32_t x, int32_t y, uint8_t font) {
+    shadowAdd(x - (int)string.length() * 3 * currentTextSize(), y, string, currentTextSize());
     log_drawString(string, DRAWCENTRESTRING, x, y);
     int16_t r;
     if (isSleeping) return string.length();
@@ -493,6 +588,7 @@ int16_t tft_logger::drawCentreString(const String &string, int32_t x, int32_t y,
 }
 
 int16_t tft_logger::drawRightString(const String &string, int32_t x, int32_t y, uint8_t font) {
+    shadowAdd(x - (int)string.length() * 6 * currentTextSize(), y, string, currentTextSize());
     log_drawString(string, DRAWRIGHTSTRING, x, y);
     int16_t r;
     if (isSleeping) return string.length();
@@ -544,6 +640,7 @@ size_t tft_logger::print(const String &s) {
         int chunkSize = (remaining > maxChunkSize) ? maxChunkSize : remaining;
         String chunk = s.substring(offset, offset + chunkSize);
 
+        shadowAdd(getCursorX(), getCursorY(), chunk, currentTextSize());
         log_print(chunk);
         if (isSleeping) totalPrinted += chunk.length();
         else totalPrinted += BRUCE_TFT_DRIVER::print(chunk);

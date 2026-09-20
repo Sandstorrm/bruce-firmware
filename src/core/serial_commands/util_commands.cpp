@@ -1,3 +1,4 @@
+#include "modules/lora/LoRaLink.h"
 #include "util_commands.h"
 #include "core/main_menu.h"
 #include "core/sd_functions.h"
@@ -210,13 +211,25 @@ uint32_t helpCallback(cmd *c) {
     return true;
 }
 
+// "nav" feedback normally goes to USB only (the BLE app parses serialDevice). A remote user driving
+// the CLI over LoRa has no USB, so for them it goes through serialDevice.
+static void navPrintln(const String &s) {
+#if defined(USE_RYLR998_VIA_UART) && !defined(LITE_VERSION)
+    if (loraLinkRemoteActive()) {
+        serialDevice->println(s);
+        return;
+    }
+#endif
+    Serial.println(s);
+}
+
 void optionsList() {
     int i = 0;
-    Serial.println("\nActual Menu: " + menuOptionLabel);
-    Serial.println("Options available: ");
+    navPrintln("\nActual Menu: " + menuOptionLabel);
+    navPrintln("Options available: ");
     for (auto opt : options) {
         String txt = (opt.hovered ? ">" : " ") + String(i) + " - " + opt.label;
-        Serial.println(txt);
+        navPrintln(txt);
         i++;
     }
 }
@@ -239,28 +252,28 @@ uint32_t navCallback(cmd *c) {
 
     // Here send press response only to USB serial to avoid problems with BLE app
     if (nav == "next") {
-        Serial.println("Next Pressed");
+        navPrintln("Next Pressed");
         var = &NextPress;
     } else if (nav == "prev") {
-        Serial.println("Prev Pressed");
+        navPrintln("Prev Pressed");
         var = &PrevPress;
     } else if (nav == "esc") {
-        Serial.println("Esc Pressed");
+        navPrintln("Esc Pressed");
         var = &EscPress;
     } else if (nav == "up") {
-        Serial.println("Up Pressed");
+        navPrintln("Up Pressed");
         var = &UpPress;
     } else if (nav == "down") {
-        Serial.println("Down Pressed");
+        navPrintln("Down Pressed");
         var = &DownPress;
     } else if (nav == "select" || nav == "sel") {
-        Serial.println("Select Pressed");
+        navPrintln("Select Pressed");
         var = &SelPress;
     } else if (nav == "nextpage") {
-        Serial.println("Next Page Pressed");
+        navPrintln("Next Page Pressed");
         var = &NextPagePress;
     } else if (nav == "prevpage") {
-        Serial.println("Prev Page Pressed");
+        navPrintln("Prev Page Pressed");
         var = &PrevPagePress;
     } else {
         serialDevice->println(
@@ -281,17 +294,56 @@ uint32_t navCallback(cmd *c) {
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     tmp = millis() - tmp;
-    Serial.printf("and Released after %lums", tmp);
+    navPrintln("and Released after " + String(tmp) + "ms");
+#if defined(USE_RYLR998_VIA_UART) && !defined(LITE_VERSION)
+    // A remote user can't see the screen: give the menu a moment to act on the press, so the list we
+    // send back shows the new selection instead of the previous one.
+    if (loraLinkRemoteActive()) vTaskDelay(pdMS_TO_TICKS(250));
+#endif
     optionsList();
 
     return true;
 }
 
+#if defined(USE_RYLR998_VIA_UART) && !defined(LITE_VERSION)
+// lora [status] | lora reset | lora restart    (inspect or kick the LoRa remote-control link)
+uint32_t loraCallback(cmd *c) {
+    Command cmd(c);
+    String action = cmd.getArgument("action").getValue();
+    action.trim();
+    if (action == "reset") {
+        loraLinkResetModule();
+        serialDevice->println("LoRa module reset requested");
+    } else if (action == "restart") {
+        loraLinkStop();
+        loraLinkBegin();
+        serialDevice->println("LoRa link restarted");
+    } else {
+        serialDevice->print(loraLinkDebug());
+    }
+    return true;
+}
+#endif
+
 uint32_t optionsCallback(cmd *c) {
     Command cmd(c);
     Argument arg = cmd.getArgument("run");
-    // int opt = arg.getValue().startsWith("-") ? -1 : arg.getValue().toInt();
-    int opt = arg.getValue().toInt();
+    String raw = arg.getValue();
+    raw.trim();
+    // A non-numeric argument (the default "-1", "list", empty, a typo, ...) means "just show me the options" --
+    // notably this also covers "options list", which used to silently select option 0 ("list".toInt() == 0).
+    bool isNumber = raw.length() > 0;
+    for (size_t i = 0; i < raw.length(); i++) {
+        if (!isDigit(raw[i])) {
+            isNumber = false;
+            break;
+        }
+    }
+    if (!isNumber) {
+        optionsList();
+        return true;
+    }
+    int opt = raw.toInt();
 
     if (opt >= 0 && opt < options.size()) {
         // wakeUpScreen(); // Do not wakeup screen if it is dimmed and using Remote control
@@ -327,17 +379,24 @@ uint32_t displayCallback(cmd *c) {
         if (tft.getLogging()) serialDevice->println("Display: Logging tft is ACTIVATED");
         else serialDevice->println("Display: Logging tft is DEACTIVATED");
     } else if (opt == "dump") {
-        uint8_t binData[MAX_LOG_ENTRIES * MAX_LOG_SIZE];
+        // (this used to be a local array of MAX_LOG_ENTRIES * MAX_LOG_SIZE = 8 KB on this task's 8 KB stack: it crashed)
+        uint8_t *binData = (uint8_t *)malloc(MAX_LOG_ENTRIES * MAX_LOG_SIZE);
+        if (!binData) {
+            serialDevice->println("Display: out of memory");
+            return false;
+        }
         size_t binSize = 0;
         tft.getBinLog(binData, binSize);
 
         serialDevice->println("Binary Dump:");
-        for (size_t i = 0; i < binSize; i++) {
-            if (i % 16 == 0) serialDevice->println();
-            // if (i % 16 == 0) serialDevice->printf("\n%04X: ", i);
-            serialDevice->printf("%02X ", binData[i]);
+        char row[16 * 3 + 1];
+        for (size_t i = 0; i < binSize; i += 16) {
+            size_t n = binSize - i < 16 ? binSize - i : 16;
+            for (size_t k = 0; k < n; k++) snprintf(row + k * 3, 4, "%02X ", binData[i + k]);
+            serialDevice->println(String(row));
         }
-        serialDevice->println("\n[End of Dump]");
+        free(binData);
+        serialDevice->println("[End of Dump]");
     } else if (opt == "info") {
         serialDevice->println(TFT_WIDTH + String("x") + TFT_HEIGHT + String("x") + ROTATION);
     } else {
@@ -374,6 +433,26 @@ uint32_t loaderCallback(cmd *c) {
             // look for a matching name
             for (int i = 0; i < _totalItems; i++) {
                 if (appname.equalsIgnoreCase(_menuItems[i]->getName())) {
+#if defined(USE_RYLR998_VIA_UART) && !defined(LITE_VERSION)
+                    // optionsMenu() runs the whole on-screen menu inside this (CLI) task and returns only when the
+                    // menu is left on the device, so a remote user's next commands would just sit and wait.
+                    // From the main menu, hand it to the UI task instead -- exactly what `options N` does.
+                    if (loraLinkRemoteActive()) {
+                        if (menuOptionLabel == "Main Menu") {
+                            for (size_t j = 0; j < options.size(); j++) {
+                                if (options[j].label.equalsIgnoreCase(_menuItems[i]->getName())) {
+                                    forceMenuOption = (int)j;
+                                    serialDevice->println(
+                                        "Opening " + _menuItems[i]->getName() + " (`options` lists it, `nav`/`options N` move)"
+                                    );
+                                    return true;
+                                }
+                            }
+                        } else {
+                            serialDevice->println("Note: this menu runs on the Core2 until it is closed there.");
+                        }
+                    }
+#endif
                     // open the associated app
                     _menuItems[i]->optionsMenu();
                     return true;
@@ -430,6 +509,11 @@ void createUtilCommands(SimpleCLI *cli) {
     Command opt = cli->addCommand("options,option", optionsCallback);
     opt.addPosArg("run", "-1");
 
+#if defined(USE_RYLR998_VIA_UART) && !defined(LITE_VERSION)
+    Command loraCmd = cli->addCommand("lora", loraCallback);
+    loraCmd.addPosArg("action", "status");
+    loraCmd.addPosArg("value", "");
+#endif
     Command loader = cli->addCommand("loader", loaderCallback);
     loader.addPosArg("cmd");
     loader.addPosArg("appname", "none"); // optional

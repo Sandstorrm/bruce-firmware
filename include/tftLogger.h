@@ -98,6 +98,9 @@ public:
     void inline setSleepMode(bool mode) { isSleeping = mode; }
 
     void getBinLog(uint8_t *outBuffer, size_t &outSize);
+    // The text currently on screen, one screen row per line ("\n" separated), kept whether or not logging is on.
+    String getScreenText();
+    uint32_t getScreenGen() const { return shadowGen; } // changes whenever the on-screen text changes
     bool removeLogEntriesInsideRect(int rx, int ry, int rw, int rh);
     void removeOverlappedImages(int x, int y, int center, int ms);
 
@@ -159,6 +162,19 @@ public:
     size_t printf(const char *format, ...);
 
 protected:
+    struct ShadowText {
+        int16_t x, y;
+        uint8_t size;
+        char text[48];
+    };
+    static constexpr int SHADOW_MAX = 48;
+    ShadowText shadow[SHADOW_MAX];
+    uint8_t shadowN = 0;
+    volatile uint32_t shadowGen = 0;
+    portMUX_TYPE shadowMux = portMUX_INITIALIZER_UNLOCKED;
+    void shadowClear();
+    void shadowRemoveInside(int rx, int ry, int rw, int rh);
+    void shadowAdd(int x, int y, const String &s, uint8_t size);
     bool isLogEqual(const tftLog &a, const tftLog &b);
     void pushLogIfUnique(const tftLog &l);
     // void checkAndLog(tftFuncs f, std::initializer_list<int32_t> values);

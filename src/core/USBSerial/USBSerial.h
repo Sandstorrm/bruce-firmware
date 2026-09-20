@@ -9,7 +9,24 @@ public:
     size_t println(const String &s) override { return out->println(s); }
     size_t print(const String &s) override { return out->print(s); }
     size_t print(const int n, int format) override { return out->print(n, format); }
-    void vprintf(const char *fmt, va_list args) override { out->printf(fmt, args); }
+    void vprintf(const char *fmt, va_list args) override {
+        // (this used to call out->printf(fmt, args): a va_list is not a vararg -- undefined behaviour and garbage output)
+        char buf[256];
+        va_list copy;
+        va_copy(copy, args);
+        int n = vsnprintf(buf, sizeof buf, fmt, args);
+        if (n > 0 && (size_t)n < sizeof buf) {
+            out->write((const uint8_t *)buf, (size_t)n);
+        } else if (n >= (int)sizeof buf) {
+            char *big = (char *)malloc((size_t)n + 1);
+            if (big) {
+                vsnprintf(big, (size_t)n + 1, fmt, copy);
+                out->write((const uint8_t *)big, (size_t)n);
+                free(big);
+            }
+        }
+        va_end(copy);
+    }
     size_t println() override { return out->println(); }
     size_t println(size_t n) override { return out->println(n); }
     size_t println(const uint32_t n) override { return out->println(n); }

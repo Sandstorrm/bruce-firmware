@@ -1,5 +1,8 @@
 #include "core/main_menu.h"
 #include <globals.h>
+#if defined(USE_RYLR998_VIA_UART) && !defined(LITE_VERSION)
+#include "modules/lora/LoRaLink.h"
+#endif
 
 #include "core/bus_HAL.h"
 #include "core/powerSave.h"
@@ -49,6 +52,7 @@ volatile bool PrevPagePress = false;
 volatile bool LongPress = false;
 volatile bool SerialCmdPress = false;
 volatile int forceMenuOption = -1;
+volatile uint8_t uiState = 0;
 volatile uint8_t menuOptionType = 0;
 String menuOptionLabel = "";
 #ifdef HAS_ENCODER_LED
@@ -566,6 +570,9 @@ void setup() {
 #endif
     //  start a task to handle serial commands while the webui is running
     startSerialCommandsHandlerTask(true);
+#if defined(USE_RYLR998_VIA_UART) && !defined(LITE_VERSION)
+    loraLinkBegin(); // remote-control link over the RYLR998 (see modules/lora/LoRaLink.h)
+#endif
 
     wakeUpScreen();
     if (bruceConfig.startupApp != "" && !startupApp.startApp(bruceConfig.startupApp)) {

@@ -541,6 +541,12 @@ int loopOptions(
         index = firstEnabled;
     }
 
+    // Tells the remote `screen view` command whether a menu is waiting for a choice (1) or something else is on screen (0)
+    struct UiMenuGuard {
+        UiMenuGuard() { uiState = 1; }
+        ~UiMenuGuard() { uiState = 0; }
+    } uiMenuGuard;
+
     Opt_Coord coord;
     bool redraw = true;
     bool exit = false;
@@ -730,6 +736,7 @@ int loopOptions(
             }
             if (chosen >= options.size() || !options[chosen].enabled) continue;
             Serial.println("Selected: " + String(options[chosen].label));
+            uiState = 0; // the chosen entry takes over the screen (an app, or a submenu that sets it back)
             options[chosen].operation();
             break;
         }

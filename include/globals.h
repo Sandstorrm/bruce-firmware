@@ -219,6 +219,8 @@ extern volatile bool LongPress;
 extern volatile bool SerialCmdPress;
 
 extern volatile int forceMenuOption;
+// 1 while a menu (loopOptions) is waiting for a choice, 0 while an app / other screen is in control.
+extern volatile uint8_t uiState;
 
 extern volatile uint8_t menuOptionType; // updates when drawing loopoptions, to send to remote controller
 
